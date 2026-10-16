@@ -1,0 +1,18 @@
+services:
+  backend:
+    container_name: ${CONTAINER:?}
+    hostname: ${WT_HOST:?}
+    volumes:
+      - ${WORKTREE_PATH:?}/sample-laravel/backend/source:/var/www/html
+    environment:
+      APP_URL: https://${WT_HOST:?}.${DEV_DOMAIN:?}:${GATEWAY_HTTPS_PORT:-8443}
+      DB_DATABASE: ${DB_NAME:?}
+      REDIS_PREFIX: "${STACK_NAME:?}:${SLUG:?}:"
+    networks:
+      main-net:
+        aliases: !override ["${WT_HOST:?}"]
+    labels:
+      io.github.epfmydx.worktree-stack.managed: "true"
+      io.github.epfmydx.worktree-stack.stack: ${STACK_NAME:?}
+      io.github.epfmydx.worktree-stack.project: sample-laravel
+      io.github.epfmydx.worktree-stack.slug: ${SLUG:?}

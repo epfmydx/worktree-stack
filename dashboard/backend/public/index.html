@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#ffffff">
+  <title>Worktree Stack — EPFMy DigitalX Services</title>
+  <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/app.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#workspace">Skip to workspace</a>
+  <header class="site-header wrap">
+    <a class="brand" href="https://epf.my/" target="_blank" rel="noopener noreferrer" aria-label="EPFMy DigitalX Services website (opens in a new tab)">
+      <img src="/assets/epfmy-logo.svg" width="220" height="67" alt="EPFMy DigitalX Services">
+    </a>
+    <div class="header-tools">
+      <span class="product-label">Worktree Stack <span aria-hidden="true">/</span> <span class="muted">Local</span></span>
+      <button id="logout-btn" class="quiet-button" hidden>Sign out <span aria-hidden="true">↗</span></button>
+    </div>
+  </header>
+
+  <main id="workspace" class="wrap" tabindex="-1">
+    <section id="login-view" class="login-layout" aria-labelledby="login-title">
+      <div class="login-content">
+        <p class="eyebrow"><span class="small-square" aria-hidden="true"></span> Local workspace</p>
+        <h1 id="login-title">Worktree<br>Stack<span class="period">.</span></h1>
+        <p class="intro">Your projects. One place to run them.</p>
+        <form id="login-form">
+          <label for="password-input">Dashboard password</label>
+          <input type="password" id="password-input" placeholder="Enter your password" autocomplete="current-password" required aria-describedby="login-help login-error">
+          <p id="login-error" class="form-error" role="alert"></p>
+          <button class="primary-button login-submit" id="login-btn" type="submit"><span>Sign in</span><span aria-hidden="true">↗</span></button>
+          <p id="login-help" class="field-help">Use the dashboard password from this stack’s local configuration.</p>
+        </form>
+      </div>
+      <div class="brand-plane" aria-hidden="true">
+        <span class="eyebrow">EPFMy DigitalX Services</span>
+        <img src="/assets/epfmy-mark-white.svg" width="280" height="280" alt="">
+        <div class="plane-caption"><span>Local development.<br>From 0 to 1.</span><span>0 → 1</span></div>
+      </div>
+    </section>
+
+    <section id="dashboard-view" hidden aria-labelledby="dashboard-title">
+      <div class="workspace-heading">
+        <div>
+          <p class="eyebrow"><span class="small-square" aria-hidden="true"></span> Local workspace</p>
+          <h1 id="dashboard-title">Worktree Stack<span class="period">.</span></h1>
+          <p class="intro">Manage the projects in this checkout.</p>
+        </div>
+        <p id="workspace-summary" class="workspace-summary">Connecting to your stack…</p>
+      </div>
+      <div class="list-heading">
+        <h2>Projects <span id="project-count" class="muted"></span></h2>
+        <div class="refresh-tools"><span id="refresh-state" class="field-help">Updates every 10s</span><button id="refresh-btn" class="quiet-button">Refresh <span aria-hidden="true">↻</span></button></div>
+      </div>
+      <p id="workspace-message" class="workspace-message" role="status" hidden></p>
+      <div id="projects" class="projects" aria-label="Compose projects"><p class="empty-state">Loading projects…</p></div>
+      <p class="workspace-note">Main environments are shown here. Manage branch environments with the worktree commands.</p>
+    </section>
+  </main>
+
+  <footer class="site-footer wrap"><span>EPFMy DigitalX Services <span aria-hidden="true">/</span> Development tools</span><span>Worktree Stack</span></footer>
+</body>
+</html>

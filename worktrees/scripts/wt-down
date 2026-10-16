@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Stop one owned development environment; preserve its Git worktree and volumes.
+set -euo pipefail
+WT_COMMAND=wt-down
+. "$(dirname "$0")/wt-common.sh"
+[[ $# -eq 2 ]] || wt_fail "usage: wt-down <project> <slug>"
+wt_load_project "$1"
+wt_set_worktree "$2"
+# Missing worktrees are allowed for orphan recovery; existing foreign roots are not.
+if [[ -e "$WORKTREE_PATH" || -L "$WORKTREE_PATH" ]]; then wt_verify_worktree; fi
+wt_check_runtime_ownership
+wt_compose down
+remaining="$(wt_runtime_ids)" || wt_fail "cannot verify container removal"
+[[ -z "$remaining" ]] || wt_fail "worktree containers remain; database retained"
+if [[ -n "$DB_NAME" ]]; then
+  wt_database_container
+  echo "wt-down: dropping $DB_NAME in ${STACK_NAME}-database/$DB_HOST"
+  docker exec "$DB_CONTAINER" /scripts/drop-db.sh "$DB_NAME"
+fi
+echo "wt-down: $CONTAINER removed; Git worktree and named volumes preserved"
+echo "Inspect source changes before separately running: git -C \"$REPO\" worktree remove \"$WORKTREE_PATH\""

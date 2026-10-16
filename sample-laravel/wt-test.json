@@ -1,0 +1,107 @@
+{
+  "version": 1,
+  "repository_scope": "stack",
+  "source_repository": ".",
+  "image_donor": "mount",
+  "host_environment": {},
+  "services": [],
+  "source_subdirectory": "sample-laravel/backend/source",
+  "container_prefix": "sample-laravel",
+  "workdir": "/var/www/html",
+  "exclude": [
+    "storage/**",
+    "bootstrap/cache/**",
+    "public/build/**",
+    ".phpunit.cache/**",
+    "coverage/**"
+  ],
+  "environment": {
+    "APP_ENV": "testing",
+    "APP_DEBUG": "true",
+    "APP_KEY": "{{app_key}}",
+    "APP_URL": "http://localhost",
+    "DB_CONNECTION": "sqlite",
+    "DB_DATABASE": ":memory:",
+    "DB_URL": "",
+    "CACHE_STORE": "array",
+    "SESSION_DRIVER": "array",
+    "QUEUE_CONNECTION": "sync",
+    "MAIL_MAILER": "array",
+    "BCRYPT_ROUNDS": "4",
+    "COMPOSER_ALLOW_SUPERUSER": "1",
+    "COMPOSER_HOME": "/tmp/composer"
+  },
+  "prepare": [
+    {
+      "scope": "container",
+      "name": "prepare writable directories",
+      "argv": [
+        "sh",
+        "-ec",
+        "mkdir -p /tmp/wt-test-reports bootstrap/cache storage/framework/cache/data storage/framework/sessions storage/framework/views storage/logs"
+      ]
+    },
+    {
+      "scope": "container",
+      "name": "install locked PHP dependencies",
+      "argv": [
+        "composer",
+        "install",
+        "--no-interaction",
+        "--prefer-dist",
+        "--no-progress",
+        "--no-scripts"
+      ]
+    },
+    {
+      "scope": "container",
+      "name": "discover Laravel packages",
+      "argv": [
+        "php",
+        "artisan",
+        "package:discover",
+        "--no-ansi"
+      ]
+    }
+  ],
+  "profiles": {
+    "full": {
+      "full_gate": true,
+      "reports": [
+        "phpunit.xml"
+      ],
+      "steps": [
+        {
+          "scope": "container",
+          "name": "sample Laravel SQLite suite",
+          "argv": [
+            "php",
+            "vendor/bin/phpunit",
+            "--log-junit",
+            "/tmp/wt-test-reports/phpunit.xml"
+          ]
+        }
+      ]
+    },
+    "smoke": {
+      "full_gate": false,
+      "reports": [
+        "phpunit.xml"
+      ],
+      "steps": [
+        {
+          "scope": "container",
+          "name": "sample Laravel HTTP smoke",
+          "argv": [
+            "php",
+            "vendor/bin/phpunit",
+            "--filter",
+            "test_the_todo_page_returns_a_successful_response",
+            "--log-junit",
+            "/tmp/wt-test-reports/phpunit.xml"
+          ]
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,25 @@
+name: ${STACK_NAME:?}-redis
+services:
+  redis:
+    image: redis:7
+    hostname: redis
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Run make init to generate credentials}
+    command: [sh, -ec, 'exec redis-server --requirepass "$$REDIS_PASSWORD" --maxmemory-policy allkeys-lru']
+    volumes: [redis-data:/data]
+    ports: ["${HOST_BIND_IP:-127.0.0.1}:${REDIS_PORT:-16379}:6379"]
+    networks:
+      main-net:
+        aliases: [redis]
+      db-net:
+        aliases: [redis]
+    restart: unless-stopped
+volumes:
+  redis-data:
+networks:
+  main-net:
+    external: true
+    name: ${STACK_NAME:?}-dev
+  db-net:
+    external: true
+    name: ${STACK_NAME:?}-db

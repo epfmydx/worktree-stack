@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Explicitly refresh a development project's seed from its main database.
+set -euo pipefail
+WT_COMMAND=wt-seed
+. "$(dirname "$0")/wt-common.sh"
+[[ $# -eq 1 ]] || wt_fail "usage: wt-seed <project>"
+wt_load_project "$1"
+[[ -n "$MAIN_DB" ]] || wt_fail "MAIN_DB is not configured for $PROJECT"
+wt_database_container
+docker exec "$DB_CONTAINER" test -x /scripts/seed-from.sh
+echo "wt-seed: refreshing $SEED_DB from $MAIN_DB in ${STACK_NAME}-database/$DB_HOST"
+docker exec "$DB_CONTAINER" /scripts/seed-from.sh "$MAIN_DB" "$SEED_DB" "$DB_USERNAME"
+echo "wt-seed: $SEED_DB ready"

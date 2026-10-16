@@ -1,0 +1,54 @@
+name: ${STACK_NAME:?}-database
+services:
+  mysql:
+    image: mysql:8.0.46-oracle
+    hostname: mysql
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./scripts/mysql:/scripts:ro
+    ports: ["${HOST_BIND_IP:-127.0.0.1}:${MYSQL_PORT:-13306}:3306"]
+    command: [--character-set-server=utf8mb4, --collation-server=utf8mb4_unicode_ci, --default-authentication-plugin=mysql_native_password]
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Run make init to generate credentials}
+    networks:
+      db-net:
+        aliases: [mysql]
+    restart: unless-stopped
+    healthcheck:
+      test: [CMD-SHELL, 'mysqladmin ping -u root -p"$$MYSQL_ROOT_PASSWORD"']
+      interval: 5s
+      timeout: 5s
+      retries: 30
+  postgres:
+    image: postgres:17.2
+    hostname: postgres
+    command: [postgres, -c, ssl=on, -c, ssl_cert_file=/certs/server.crt, -c, ssl_key_file=/certs/server.key]
+    # Copy host-generated keys to a native volume with postgres ownership before startup.
+    entrypoint: [sh, -ec, 'mkdir -p /certs; cp /host-certs/server.crt /host-certs/server.key /certs/; chown postgres:postgres /certs/*; chmod 600 /certs/server.key; exec docker-entrypoint.sh "$$@"', --]
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - postgres-certs:/certs
+      - ./postgres17/certs:/host-certs:ro
+      - ./scripts/postgres:/scripts:ro
+    ports: ["${HOST_BIND_IP:-127.0.0.1}:${POSTGRES_PORT:-15432}:5432"]
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-dev}
+      POSTGRES_USER: ${POSTGRES_USER:-dev}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run make init to generate credentials}
+    networks:
+      db-net:
+        aliases: [postgres]
+    restart: unless-stopped
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -d "$$POSTGRES_DB" -U "$$POSTGRES_USER"']
+      interval: 5s
+      timeout: 5s
+      retries: 30
+volumes:
+  mysql-data:
+  postgres-data:
+  postgres-certs:
+networks:
+  db-net:
+    external: true
+    name: ${STACK_NAME:?}-db

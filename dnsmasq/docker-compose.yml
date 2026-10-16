@@ -1,0 +1,21 @@
+name: ${STACK_NAME:?}-dnsmasq
+services:
+  dnsmasq:
+    build: .
+    image: ${STACK_NAME:?}/dnsmasq:local
+    hostname: dnsmasq
+    environment:
+      DEV_DOMAIN: ${DEV_DOMAIN:?}
+      GATEWAY_IP: ${GATEWAY_IP:?}
+    volumes:
+      - ./dnsmasq.conf.template:/etc/dnsmasq.conf.template:ro
+    networks:
+      main-net:
+        ipv4_address: ${DNSMASQ_IP:?}
+        aliases: [dnsmasq]
+    cap_add: [NET_ADMIN]
+    restart: unless-stopped
+networks:
+  main-net:
+    external: true
+    name: ${STACK_NAME:?}-dev

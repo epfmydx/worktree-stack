@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Start a registered whole-stack Git worktree's development environment.
+set -euo pipefail
+WT_COMMAND=wt-spin
+. "$(dirname "$0")/wt-common.sh"
+[[ $# -eq 2 ]] || wt_fail "usage: wt-spin <project> <slug>"
+wt_load_project "$1"
+wt_set_worktree "$2"
+wt_verify_worktree
+[[ -n "$SOURCE_PATH_REL" ]] || wt_fail "SOURCE_PATH_REL is required in $WT_CONFIG"
+case "/$SOURCE_PATH_REL/" in *'/../'*|*'/./'*|'//'*) wt_fail "SOURCE_PATH_REL must be a project-relative directory" ;; esac
+[[ "$SOURCE_PATH_REL" != /* && -d "$WORKTREE_PATH/$PROJECT/$SOURCE_PATH_REL" ]] || wt_fail "source directory missing in selected worktree: $PROJECT/$SOURCE_PATH_REL"
+wt_check_runtime_ownership
+if [[ -n "$MAIN_DB" && -z "$RUNTIME_IDS" ]]; then
+  wt_database_container
+  docker exec "$DB_CONTAINER" test -x /scripts/clone-db.sh
+  echo "wt-spin: cloning $SEED_DB -> $DB_NAME in ${STACK_NAME}-database/$DB_HOST"
+  # Never overwrite an existing clone. Use wt-down after incomplete first startup.
+  docker exec "$DB_CONTAINER" /scripts/clone-db.sh "$SEED_DB" "$DB_NAME" "$DB_USERNAME"
+fi
+wt_compose up -d
+wt_check_runtime_ownership
+[[ -n "$RUNTIME_IDS" ]] || wt_fail "Compose returned without creating worktree containers"
+if declare -f wt_post_spin >/dev/null 2>&1; then
+  wt_post_spin "$SLUG" "$CONTAINER" "$WORKTREE_PATH"
+fi
+echo "wt-spin: $CONTAINER is up"
+echo "  URL: $(wt_url)"
+if [[ -n "$DB_NAME" ]]; then echo "  DB: $DB_NAME"; fi

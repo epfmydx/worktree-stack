@@ -1,0 +1,25 @@
+name: Toolkit checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  toolkit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: python3 -m unittest discover -s worktrees/scripts/tests -p 'test_*.py' -v
+      - run: node --check dashboard/backend/public/app.js
+      - run: node --test dashboard/backend/docker.test.js
+      - run: python3 scripts/test_infrastructure.py -v
+      - run: make init && make config
+      - run: docker pull ubuntu:24.04
+      - name: Disposable Docker acceptance
+        env:
+          WT_TEST_DOCKER_IMAGE: ubuntu:24.04
+        run: python3 -m unittest discover -s worktrees/scripts/tests -p test_wt_test_docker.py -v

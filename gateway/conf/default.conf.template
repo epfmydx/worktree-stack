@@ -1,0 +1,12 @@
+server {
+    listen 80 default_server;
+    return 301 https://$host:${GATEWAY_HTTPS_PORT}$request_uri;
+}
+server {
+    listen 443 ssl default_server;
+    http2 on;
+    ssl_certificate /etc/nginx/certs/fullchain.pem;
+    ssl_certificate_key /etc/nginx/certs/privkey.pem;
+    root /var/www/html;
+    index index.html;
+}

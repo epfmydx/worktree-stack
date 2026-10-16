@@ -1,0 +1,32 @@
+name: ${STACK_NAME:?}-sample-laravel
+services:
+  backend:
+    build:
+      context: ./backend
+      args:
+        BASE_IMAGE: ${STACK_NAME:?}/php-laravel:${PHP_VERSION:-8.4}
+    hostname: sample-laravel
+    volumes:
+      - ./backend/source:/var/www/html
+      - ./backend/vscode:/var/www/.vscode-server
+    environment:
+      APP_URL: https://sample-laravel.${DEV_DOMAIN:?}:${GATEWAY_HTTPS_PORT:-8443}
+      DB_CONNECTION: mysql
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_DATABASE: sample_laravel
+      DB_USERNAME: root
+      DB_PASSWORD: ${MYSQL_ROOT_PASSWORD:?}
+      REDIS_HOST: redis
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?}
+    networks:
+      main-net:
+        aliases: [sample-laravel]
+      db-net:
+networks:
+  main-net:
+    external: true
+    name: ${STACK_NAME:?}-dev
+  db-net:
+    external: true
+    name: ${STACK_NAME:?}-db

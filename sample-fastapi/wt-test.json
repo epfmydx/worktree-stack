@@ -1,0 +1,126 @@
+{
+  "version": 1,
+  "repository_scope": "stack",
+  "source_repository": ".",
+  "image_donor": "mount",
+  "host_environment": {},
+  "services": [
+    {
+      "name": "ci-postgres",
+      "image": "postgres:17.2",
+      "environment": {
+        "POSTGRES_DB": "worktree_ci",
+        "POSTGRES_USER": "ci",
+        "POSTGRES_PASSWORD": "{{test_password}}"
+      },
+      "tmpfs": [
+        "/var/lib/postgresql/data:rw,size=256m"
+      ],
+      "ready": [
+        "pg_isready",
+        "-U",
+        "ci",
+        "-d",
+        "worktree_ci"
+      ],
+      "ready_timeout": 90
+    }
+  ],
+  "source_subdirectory": "sample-fastapi/source/backend",
+  "container_prefix": "sample-fastapi-api",
+  "workdir": "/app",
+  "exclude": [
+    ".venv/**",
+    "**/__pycache__/**",
+    ".pytest_cache/**",
+    "*.egg-info/**",
+    "coverage/**"
+  ],
+  "environment": {
+    "ENVIRONMENT": "testing",
+    "WORKTREE_STACK_CI": "1",
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "PYTHONUNBUFFERED": "1",
+    "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+    "DATABASE_URL": "postgresql+asyncpg://ci:{{test_password}}@ci-postgres:5432/worktree_ci"
+  },
+  "prepare": [
+    {
+      "scope": "container",
+      "name": "prepare report directory",
+      "argv": [
+        "mkdir",
+        "-p",
+        "/tmp/wt-test-reports"
+      ]
+    },
+    {
+      "scope": "container",
+      "name": "install constrained sample Python dependencies",
+      "argv": [
+        "python",
+        "-m",
+        "pip",
+        "install",
+        "--no-cache-dir",
+        "-c",
+        "requirements-ci.txt",
+        "-e",
+        ".[dev]"
+      ]
+    },
+    {
+      "scope": "container",
+      "name": "migrate disposable PostgreSQL",
+      "argv": [
+        "alembic",
+        "upgrade",
+        "head"
+      ]
+    }
+  ],
+  "profiles": {
+    "full": {
+      "full_gate": true,
+      "reports": [
+        "pytest.xml"
+      ],
+      "steps": [
+        {
+          "scope": "container",
+          "name": "sample FastAPI PostgreSQL suite",
+          "argv": [
+            "python",
+            "-m",
+            "pytest",
+            "-q",
+            "--strict-markers",
+            "--junitxml=/tmp/wt-test-reports/pytest.xml"
+          ]
+        }
+      ]
+    },
+    "smoke": {
+      "full_gate": false,
+      "reports": [
+        "pytest.xml"
+      ],
+      "steps": [
+        {
+          "scope": "container",
+          "name": "sample FastAPI health and schema",
+          "argv": [
+            "python",
+            "-m",
+            "pytest",
+            "-q",
+            "-m",
+            "not database",
+            "--strict-markers",
+            "--junitxml=/tmp/wt-test-reports/pytest.xml"
+          ]
+        }
+      ]
+    }
+  }
+}

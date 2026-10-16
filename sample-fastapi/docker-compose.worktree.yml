@@ -1,0 +1,44 @@
+services:
+  caddy:
+    container_name: ${CONTAINER:?}
+    hostname: ${WT_HOST:?}
+    environment:
+      BACKEND_HOST: ${WT_HOST:?}-api
+      FRONTEND_HOST: ${WT_HOST:?}-fe
+    networks:
+      main-net:
+        aliases: !override ["${WT_HOST:?}"]
+    labels:
+      io.github.epfmydx.worktree-stack.managed: "true"
+      io.github.epfmydx.worktree-stack.stack: ${STACK_NAME:?}
+      io.github.epfmydx.worktree-stack.project: sample-fastapi
+      io.github.epfmydx.worktree-stack.slug: ${SLUG:?}
+  backend:
+    container_name: ${CONTAINER:?}-api
+    hostname: ${WT_HOST:?}-api
+    volumes:
+      - ${WORKTREE_PATH:?}/sample-fastapi/source/backend:/app
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:?}:${POSTGRES_PASSWORD:?}@postgres:5432/${DB_NAME:?}
+      BASE_URL: https://${WT_HOST:?}.${DEV_DOMAIN:?}:${GATEWAY_HTTPS_PORT:-8443}
+    networks:
+      main-net:
+        aliases: !override ["${WT_HOST:?}-api"]
+    labels:
+      io.github.epfmydx.worktree-stack.managed: "true"
+      io.github.epfmydx.worktree-stack.stack: ${STACK_NAME:?}
+      io.github.epfmydx.worktree-stack.project: sample-fastapi
+      io.github.epfmydx.worktree-stack.slug: ${SLUG:?}
+  frontend:
+    container_name: ${CONTAINER:?}-fe
+    hostname: ${WT_HOST:?}-fe
+    volumes:
+      - ${WORKTREE_PATH:?}/sample-fastapi/source/frontend:/app
+    networks:
+      main-net:
+        aliases: !override ["${WT_HOST:?}-fe"]
+    labels:
+      io.github.epfmydx.worktree-stack.managed: "true"
+      io.github.epfmydx.worktree-stack.stack: ${STACK_NAME:?}
+      io.github.epfmydx.worktree-stack.project: sample-fastapi
+      io.github.epfmydx.worktree-stack.slug: ${SLUG:?}

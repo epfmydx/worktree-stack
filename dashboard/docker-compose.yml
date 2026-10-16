@@ -1,0 +1,22 @@
+name: ${STACK_NAME:?}-dashboard
+services:
+  backend:
+    build: ./backend
+    hostname: dashboard
+    environment:
+      DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:?Run make init to generate credentials}
+      PORT: 80
+      HOST_CONTAINERS_PATH: ${HOST_CONTAINERS_PATH:?Run make init}
+      STACK_NAME: ${STACK_NAME:?}
+    volumes:
+      # Opt-in service: Docker socket access grants control of the local daemon.
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${HOST_CONTAINERS_PATH:?}:${HOST_CONTAINERS_PATH:?}:ro
+    restart: unless-stopped
+    networks:
+      main-net:
+        aliases: [dashboard]
+networks:
+  main-net:
+    external: true
+    name: ${STACK_NAME:?}-dev

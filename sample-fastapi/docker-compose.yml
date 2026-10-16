@@ -1,0 +1,50 @@
+name: ${STACK_NAME:?}-sample-fastapi
+services:
+  caddy:
+    image: caddy:2-alpine
+    hostname: sample-fastapi
+    # This HTTP-only proxy needs no persistent image-declared Caddy volumes.
+    tmpfs: [/data, /config]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    networks:
+      main-net:
+        aliases: [sample-fastapi]
+  backend:
+    build: ./source/backend
+    hostname: sample-fastapi-api
+    working_dir: /app
+    command: >-
+      sh -c "pip install -e '.[dev]' && alembic upgrade head &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --proxy-headers --forwarded-allow-ips='*'"
+    volumes:
+      - ./source/backend:/app
+    environment:
+      PYTHONDONTWRITEBYTECODE: 1
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:?}:${POSTGRES_PASSWORD:?}@postgres:5432/sample_fastapi
+      ENVIRONMENT: development
+      BASE_URL: https://sample-fastapi.${DEV_DOMAIN:?}:${GATEWAY_HTTPS_PORT:-8443}
+    networks:
+      main-net:
+        aliases: [sample-fastapi-api]
+      db-net:
+  frontend:
+    image: node:22-alpine
+    hostname: sample-fastapi-fe
+    working_dir: /app
+    command: sh -c "npm ci && npm run dev -- --host 0.0.0.0 --port 80"
+    volumes:
+      - ./source/frontend:/app
+    environment:
+      VITE_HMR_PORT: ${GATEWAY_HTTPS_PORT:-8443}
+      VITE_ALLOWED_HOSTS: .${DEV_DOMAIN:?}
+    networks:
+      main-net:
+        aliases: [sample-fastapi-fe]
+networks:
+  main-net:
+    external: true
+    name: ${STACK_NAME:?}-dev
+  db-net:
+    external: true
+    name: ${STACK_NAME:?}-db

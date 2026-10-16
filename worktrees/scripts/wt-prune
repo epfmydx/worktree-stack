@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Remove labelled interactive environments whose expected worktree is absent.
+set -euo pipefail
+WT_COMMAND=wt-prune
+. "$(dirname "$0")/wt-common.sh"
+[[ $# -eq 0 ]] || wt_fail "usage: wt-prune"
+wt_load_stack
+ids="$(docker container ls --all --filter "label=$WT_LABEL.managed=true" --filter "label=$WT_LABEL.stack=$STACK_NAME" --format '{{.ID}}')" || wt_fail "cannot inventory managed environments"
+found=0
+seen=""
+candidates=""
+while IFS= read -r id; do
+  [[ -n "$id" ]] || continue
+  labels="$(docker inspect --format "{{index .Config.Labels \"$WT_LABEL.project\"}}|{{index .Config.Labels \"$WT_LABEL.slug\"}}|{{index .Config.Labels \"$WT_LABEL.ci\"}}" "$id")" || wt_fail "cannot inspect $id"
+  IFS='|' read -r project slug ci <<< "$labels"
+  [[ "$ci" != true ]] || continue
+  wt_name "$project" project
+  wt_name "$slug" slug
+  expected="$REPO/worktrees/$slug"
+  [[ ! -e "$expected" && ! -L "$expected" ]] || continue
+  case " $seen " in *" $project/$slug "*) continue ;; esac
+  seen="$seen $project/$slug"
+  candidates="$candidates $project/$slug"
+done <<< "$ids"
+# Inspect all services before removing any: one down can remove several entries.
+for target in $candidates; do
+  project="${target%/*}"; slug="${target#*/}"
+  echo "wt-prune: removing $project/$slug (worktree missing)"
+  "$REPO/worktrees/scripts/wt-down" "$project" "$slug"
+  found=$((found + 1))
+done
+echo "wt-prune: removed $found orphan environment(s)"

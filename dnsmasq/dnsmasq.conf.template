@@ -1,0 +1,9 @@
+# Answer *.${DEV_DOMAIN} and the apex with the gateway's static IP on the scoped development network
+address=/${DEV_DOMAIN}/${GATEWAY_IP}
+
+# Hygiene: don't forward nonsense upstream
+domain-needed
+bogus-priv
+
+# Cache answers so we aren't hammering upstream
+cache-size=1000

@@ -1,0 +1,30 @@
+name: ${STACK_NAME:?Run make init}-gateway
+services:
+  web:
+    image: nginx:1.27-alpine
+    hostname: gateway
+    environment:
+      DEV_DOMAIN: ${DEV_DOMAIN:?}
+      GATEWAY_HTTPS_PORT: ${GATEWAY_HTTPS_PORT:?}
+      # Limit envsubst to our variables; keep nginx $host/$backend intact.
+      NGINX_ENVSUBST_FILTER: ^(DEV_DOMAIN|GATEWAY_HTTPS_PORT)$$
+    volumes:
+      - ./conf/default.conf.template:/etc/nginx/templates/default.conf.template:ro
+      - ./conf/projects.conf.template:/etc/nginx/templates/projects.conf.template:ro
+      - ./conf/vite.conf.template:/etc/nginx/templates/vite.conf.template:ro
+      - ./certs:/etc/nginx/certs:ro
+      - ./default:/var/www/html:ro
+    ports:
+      - "${HOST_BIND_IP:-127.0.0.1}:${GATEWAY_HTTP_PORT:-8080}:80"
+      - "${HOST_BIND_IP:-127.0.0.1}:${GATEWAY_HTTPS_PORT:-8443}:443"
+      - "${HOST_BIND_IP:-127.0.0.1}:${VITE_PORT:-5173}:5173"
+    networks:
+      main-net:
+        ipv4_address: ${GATEWAY_IP:?}
+        aliases: [gateway]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    restart: unless-stopped
+networks:
+  main-net:
+    external: true
+    name: ${STACK_NAME:?}-dev

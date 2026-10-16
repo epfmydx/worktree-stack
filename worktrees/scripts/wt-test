@@ -1,0 +1,616 @@
+#!/usr/bin/env python3
+"""Run a registered worktree's checks in a disposable Docker source snapshot."""
+import argparse
+import base64
+import fnmatch
+import hashlib
+import io
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import secrets
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+
+OWNER = "io.github.epfmydx.worktree-stack.ci"
+RUN_LABEL = OWNER + ".run"
+SAFE_NAME = re.compile(r"[a-z][a-z0-9-]*\Z")
+DEFAULT_EXCLUDES = [".git", ".git/**", "**/.git", "**/.git/**", ".env", ".env.*",
+                    "**/.env", "**/.env.*", "**/.secrets*", ".secrets*",
+                    ".secrets*/**", "vendor", "vendor/**", "node_modules",
+                    "node_modules/**"]
+
+
+class Refusal(Exception):
+    pass
+
+
+class Interrupted(Exception):
+    def __init__(self, signum):
+        self.signum = signum
+
+
+def output(argv, **kwargs):
+    kwargs.setdefault("timeout", 30)
+    p = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs)
+    if p.returncode:
+        raise Refusal(f"{argv[0]} failed: {p.stderr.decode(errors='replace').strip()}")
+    return p.stdout.decode().removesuffix("\n")
+
+
+def git(root, *args):
+    return output(["git", "-C", str(root), *args])
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def json_bytes(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def write_json(path, value):
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    temporary.replace(path)
+
+
+def excluded(name, patterns):
+    return any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns)
+
+
+def safe_relative(name):
+    path = PurePosixPath(name)
+    if not name or path.is_absolute() or ".." in path.parts or "\0" in name:
+        raise Refusal(f"Not a relative snapshot path: {name!r}")
+    return path
+
+
+def resolve_worktree(stack, project, slug, config):
+    for name in (project, slug):
+        if not SAFE_NAME.fullmatch(name):
+            raise Refusal("Project and slug must match [a-z][a-z0-9-]*")
+    relative = safe_relative(config["source_repository"])
+    scope = config.get("repository_scope", "project")
+    if scope == "stack":
+        if str(relative) != ".":
+            raise Refusal("Stack adapters must use source_repository='.'")
+        repository = stack.resolve()
+        worktree = (stack / "worktrees" / slug).resolve()
+        source_relative = safe_relative(config["source_subdirectory"])
+    elif scope == "project":
+        repository = (stack / project / relative).resolve()
+        worktree = (stack / "worktrees" / project / slug).resolve()
+        source_relative = Path(".")
+    else:
+        raise Refusal("repository_scope must be project or stack")
+    if Path(git(repository, "rev-parse", "--show-toplevel")).resolve() != repository:
+        raise Refusal("Configured source repository is not its Git root")
+    if Path(git(worktree, "rev-parse", "--show-toplevel")).resolve() != worktree:
+        raise Refusal("Selected worktree is not its Git root")
+    common = git(repository, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    other = git(worktree, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if Path(common).resolve() != Path(other).resolve():
+        raise Refusal("Worktree belongs to another repository")
+    registered = git(repository, "worktree", "list", "--porcelain", "-z").split("\0")
+    paths = {str(Path(item[9:]).resolve()) for item in registered if item.startswith("worktree ")}
+    if str(worktree) not in paths:
+        raise Refusal("Worktree is not registered with the configured repository")
+    source = worktree / source_relative
+    for ancestor in (source, *source.parents):
+        if ancestor == worktree:
+            break
+        if ancestor.is_symlink():
+            raise Refusal("Source subdirectory must not contain symlinks")
+    source = source.resolve()
+    if not source.is_dir() or not source.is_relative_to(worktree):
+        raise Refusal("Source subdirectory must be a directory inside the worktree")
+    if Path(git(source, "rev-parse", "--show-toplevel")).resolve() != worktree:
+        raise Refusal("Source subdirectory belongs to a nested repository")
+    return source
+
+
+def scan_source(root, patterns, archive=None):
+    # The explicit pathspec bounds stack-repository snapshots to this app subtree.
+    # Git emits paths relative to the current directory, including for dirty files.
+    stages = git(root, "ls-files", "--stage", "-z", "--", ".").split("\0")
+    if any(line.startswith("160000 ") for line in stages):
+        raise Refusal("Submodules require an explicit snapshot adapter; unsupported here")
+    names = git(root, "ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", ".").split("\0")
+    entries = {}
+    for name in sorted(set(filter(None, names))):
+        safe_relative(name)
+        if excluded(name, patterns):
+            continue
+        path = root / name
+        if not path.exists() and not path.is_symlink():
+            continue  # Working-tree deletion: absent from a fresh volume.
+        for parent in path.parents:
+            if parent == root:
+                break
+            if parent.is_symlink():
+                raise Refusal(f"Symlink ancestor is unsupported: {name}")
+        info = path.lstat()
+        member = tarfile.TarInfo(name)
+        member.mode = stat.S_IMODE(info.st_mode) & 0o777
+        if stat.S_ISLNK(info.st_mode):
+            # Linux symlink modes are always 0777; macOS may report 0755.
+            member.mode = 0o777
+            target = os.readlink(path)
+            if os.path.isabs(target):
+                raise Refusal(f"Absolute symlink is not portable: {name}")
+            try:
+                destination = path.resolve().relative_to(root).as_posix()
+            except (ValueError, RuntimeError):
+                raise Refusal(f"Symlink escapes snapshot: {name}") from None
+            if excluded(destination, patterns):
+                raise Refusal(f"Symlink targets excluded data: {name}")
+            entries[name] = {"kind": "symlink", "mode": member.mode, "target": target}
+            member.type = tarfile.SYMTYPE
+            member.linkname = target
+            if archive:
+                archive.addfile(member)
+        elif stat.S_ISREG(info.st_mode):
+            data = path.read_bytes()
+            entries[name] = {"kind": "file", "mode": member.mode, "sha256": digest(data)}
+            member.size = len(data)
+            if archive:
+                archive.addfile(member, io.BytesIO(data))
+        else:
+            raise Refusal(f"Unsupported source file type: {name}")
+    return entries
+
+
+def snapshot(root, archive_path, patterns):
+    head = git(root, "rev-parse", "HEAD")
+    with tarfile.open(archive_path, "w") as archive:
+        entries = scan_source(root, patterns, archive)
+    if entries != scan_source(root, patterns) or head != git(root, "rev-parse", "HEAD"):
+        archive_path.unlink()
+        raise Refusal("Source changed while snapshotting; retry after edits settle")
+    return {"head": head, "source": str(root), "files": entries,
+            "fingerprint": digest(json_bytes(entries)), "exclusions": patterns,
+            "archive_sha256": digest(archive_path.read_bytes())}
+
+
+def expand(value, variables):
+    if isinstance(value, str):
+        return re.sub(r"\{\{([a-z_]+)\}\}", lambda m: variables[m[1]], value)
+    if isinstance(value, list):
+        return [expand(item, variables) for item in value]
+    if isinstance(value, dict):
+        return {key: expand(item, variables) for key, item in value.items()}
+    return value
+
+
+def clean_environment():
+    names = {"PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "LANG", "LC_ALL",
+             "DOCKER_CONFIG", "DOCKER_CONTEXT", "DOCKER_HOST", "DOCKER_TLS_VERIFY",
+             "DOCKER_CERT_PATH"}
+    return {key: value for key, value in os.environ.items() if key in names}
+
+
+def load_config(path):
+    config = json.loads(path.read_text())
+    required = {"version", "source_repository", "container_prefix", "workdir",
+                "environment", "host_environment", "prepare", "profiles", "services"}
+    if not required.issubset(config) or config["version"] != 1:
+        raise Refusal("Invalid wt-test.json adapter (expected version 1)")
+    if not SAFE_NAME.fullmatch(config["container_prefix"]):
+        raise Refusal("Invalid adapter container prefix")
+    if config.get("repository_scope", "project") not in ("project", "stack"):
+        raise Refusal("repository_scope must be project or stack")
+    if config.get("repository_scope") == "stack" and not config.get("source_subdirectory"):
+        raise Refusal("Stack adapters need source_subdirectory")
+    if config.get("image_donor", "name") not in ("name", "mount"):
+        raise Refusal("image_donor must be name or mount")
+    for profile in config["profiles"].values():
+        if not isinstance(profile.get("full_gate"), bool) or not profile.get("steps"):
+            raise Refusal("Every profile needs full_gate and nonempty steps")
+    return config
+
+
+class Runner:
+    def __init__(self, stack, args, config):
+        self.stack, self.args, self.config = stack, args, config
+        self.worktree = resolve_worktree(stack, args.project, args.slug, config)
+        self.run_id = secrets.token_hex(8)
+        self.run_slug = "ci-" + self.run_id
+        self.container = config["container_prefix"] + "-" + self.run_slug
+        self.resource = "wt-test-" + args.project + "-" + self.run_id
+        self.volume, self.network = self.resource + "-source", self.resource + "-net"
+        self.report = (Path(args.output_dir).expanduser().resolve() if args.output_dir else
+                       stack / "worktrees" / "test-results" / args.project / args.slug / self.run_id)
+        if self.report.exists():
+            raise Refusal("Report directory already exists; choose a new one")
+        self.report.mkdir(parents=True, mode=0o700)
+        self.temporary = tempfile.TemporaryDirectory(prefix="wt-test-")
+        self.controller = Path(self.temporary.name)
+        self.base_env = clean_environment()
+        self.variables = {"container": self.container, "run_id": self.run_id,
+                          "run_slug": self.run_slug, "db_suffix": self.run_slug.replace("-", "_"),
+                          "reports": str(self.report), "worktree_slug": args.slug,
+                          "test_password": secrets.token_urlsafe(24),
+                          "app_key": "base64:" + base64.b64encode(os.urandom(32)).decode()}
+        self.env = self.base_env | expand(config["host_environment"], self.variables)
+        self.resources = []
+        self.child = None
+        self.result = {"version": 1, "run_id": self.run_id, "project": args.project,
+                       "slug": args.slug, "profile": args.profile, "status": "preparing",
+                       "full_gate": config["profiles"][args.profile]["full_gate"],
+                       "report_directory": str(self.report), "steps": [], "resources": [],
+                       "cleanup_errors": [], "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+
+    def save(self):
+        write_json(self.report / "result.json", self.result)
+
+    def docker_json(self, kind, name):
+        return json.loads(output(["docker", kind, "inspect", name], env=self.base_env))[0]
+
+    def resource_exists(self, kind, name):
+        # A failed inspect is ambiguous (not found, daemon down, permissions, ...).
+        # Only a successful inventory can establish absence during cleanup.
+        argv = ["docker", kind, "ls"]
+        if kind == "container":
+            argv += ["--all"]
+        field = "Names" if kind == "container" else "Name"
+        argv += ["--filter", "name=" + name, "--format", "{{." + field + "}}"]
+        return name in output(argv, env=self.base_env).splitlines()
+
+    def labels(self):
+        return ["--label", OWNER + "=true", "--label", RUN_LABEL + "=" + self.run_id,
+                "--label", OWNER + ".project=" + self.args.project]
+
+    def remember(self, kind, name):
+        self.resources.append((kind, name))
+        self.result["resources"].append({"kind": kind, "name": name})
+        self.save()
+
+    def create_resource(self, kind, name, argv, label, *, env=None):
+        if self.resource_exists(kind, name):
+            raise Refusal(f"Resource already exists: {name}")
+        # The daemon can create the resource even if the client is interrupted.
+        self.remember(kind, name)
+        self.command(argv, label, env=env)
+
+    def command(self, argv, label, *, env=None, cwd=None, stdin=None):
+        print(f"wt-test: {label}", flush=True)
+        started = time.monotonic()
+        filename = f"{len(self.result['steps']) + 1:02d}-{re.sub(r'[^a-z0-9-]+', '-', label.lower()).strip('-')}.log"
+        with (self.report / filename).open("wb") as log:
+            self.child = subprocess.Popen(argv, cwd=cwd, env=env or self.env,
+                                          stdin=stdin or subprocess.DEVNULL,
+                                          stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+            try:
+                code = self.child.wait()
+            except Interrupted:
+                self.terminate_child()
+                raise
+            finally:
+                self.child = None
+        self.result["steps"].append({"name": label, "exit_code": code, "log": filename,
+                                     "seconds": round(time.monotonic() - started, 3)})
+        self.save()
+        if code:
+            raise Refusal(f"{label} failed (exit {code}); see {self.report / filename}")
+
+    def terminate_child(self):
+        if self.child is None or self.child.poll() is not None:
+            return
+        try:
+            os.killpg(self.child.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        try:
+            self.child.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(self.child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            self.child.wait()
+
+    def image(self):
+        if self.args.image:
+            image = self.docker_json("image", self.args.image)
+        else:
+            if self.config.get("image_donor") == "mount":
+                # Discover only running containers; accept one exact bind source.
+                # Stack names and service suffixes need not leak into the adapter.
+                candidates = output(["docker", "container", "ls", "--format", "{{.ID}}"], env=self.base_env).splitlines()
+                donors = []
+                for candidate in candidates:
+                    details = self.docker_json("container", candidate)
+                    mounts = [m for m in details["Mounts"] if m["Destination"] == self.config["workdir"]]
+                    if (len(mounts) == 1 and mounts[0]["Type"] == "bind"
+                            and Path(mounts[0]["Source"]).resolve() == self.worktree):
+                        donors.append(details)
+                if len(donors) != 1:
+                    raise Refusal("Expected one running image donor for this source mount; specify --image explicitly")
+                donor = donors[0]
+                donor_name = donor["Name"].lstrip("/")
+            else:
+                donor_name = self.config["container_prefix"] + "-" + self.args.slug
+                donor = self.docker_json("container", donor_name)
+            matches = [m for m in donor["Mounts"] if m["Destination"] == self.config["workdir"]]
+            if len(matches) != 1 or matches[0]["Type"] != "bind" or Path(matches[0]["Source"]).resolve() != self.worktree:
+                raise Refusal("Image donor does not mount the selected worktree; specify --image explicitly")
+            image = self.docker_json("image", donor["Image"])
+            self.result["image_donor"] = donor_name
+        if image.get("Config", {}).get("Volumes"):
+            raise Refusal("Runtime image declares implicit volumes; use an image with explicit storage")
+        self.result["image"] = image["Id"]
+        self.result["architecture"] = image["Architecture"]
+        return image["Id"]
+
+    def create_service(self, original):
+        service = expand(original, self.variables)
+        alias = service["name"]
+        if not SAFE_NAME.fullmatch(alias):
+            raise Refusal("Invalid service name")
+        name = self.resource + "-" + alias
+        image = self.docker_json("image", service["image"])
+        tmpfs_paths = {mount.split(":", 1)[0] for mount in service.get("tmpfs", [])}
+        if set(image.get("Config", {}).get("Volumes") or {}) - tmpfs_paths:
+            raise Refusal("Service image volumes must all be covered by explicit tmpfs")
+        environment = service.get("environment", {})
+        argv = ["docker", "create", "--name", name, *self.labels(), "--network", self.network,
+                "--network-alias", alias]
+        for key in environment:
+            argv += ["--env", key]
+        for mount in service.get("tmpfs", []):
+            argv += ["--tmpfs", mount]
+        argv += [image["Id"], *service.get("command", [])]
+        self.create_resource("container", name, argv, "create " + alias, env=self.base_env | environment)
+        self.command(["docker", "start", name], "start " + alias)
+        self.result.setdefault("service_images", {})[alias] = image["Id"]
+        ready_env = service.get("ready_environment", {})
+        ready = ["docker", "exec"]
+        for key in ready_env:
+            ready += ["--env", key]
+        ready += [name, *service["ready"]]
+        deadline = time.monotonic() + service.get("ready_timeout", 90)
+        while time.monotonic() < deadline:
+            try:
+                check = subprocess.run(ready, env=self.base_env | ready_env, stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL, timeout=10)
+            except subprocess.TimeoutExpired:
+                continue
+            if check.returncode == 0:
+                return
+            if not self.docker_json("container", name)["State"]["Running"]:
+                break
+            time.sleep(1)
+        raise Refusal(f"Service {alias} did not become ready")
+
+    def execute_step(self, raw):
+        step = expand(raw, self.variables)
+        if step["scope"] == "host":
+            self.command(step["argv"], step["name"], cwd=self.controller)
+        elif step["scope"] == "container":
+            self.command(["docker", "exec", "-w", self.config["workdir"], self.container, *step["argv"]], step["name"])
+        else:
+            raise Refusal("Adapter step scope must be host or container")
+
+    def verify_snapshot(self, manifest):
+        listing = b"".join(name.encode() + b"\0" for name in manifest["files"])
+        result = subprocess.run(["docker", "exec", "-i", self.container, "tar", "--no-recursion",
+                                 "--null", "-T", "-", "-cf", "-"], input=listing,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.base_env)
+        if result.returncode:
+            raise Refusal("Could not verify container snapshot")
+        actual = {}
+        with tarfile.open(fileobj=io.BytesIO(result.stdout)) as archive:
+            for entry in archive:
+                if entry.isfile():
+                    actual[entry.name] = {"kind": "file", "mode": entry.mode & 0o777,
+                                          "sha256": digest(archive.extractfile(entry).read())}
+                elif entry.issym():
+                    actual[entry.name] = {"kind": "symlink", "mode": entry.mode & 0o777, "target": entry.linkname}
+                else:
+                    raise Refusal("Unexpected file type in container snapshot")
+        if actual != manifest["files"]:
+            changed = sorted(name for name in set(actual) | set(manifest["files"])
+                             if actual.get(name) != manifest["files"].get(name))
+            raise Refusal("Container source differs from the frozen input manifest: " +
+                          ", ".join(changed[:10]) + (" ..." if len(changed) > 10 else ""))
+
+    def run(self):
+        image = self.image()
+        archive_path = self.controller / "source.tar"
+        patterns = DEFAULT_EXCLUDES + self.config.get("exclude", [])
+        manifest = snapshot(self.worktree, archive_path, patterns)
+        write_json(self.report / "input-manifest.json", manifest)
+        self.result["fingerprint"] = manifest["fingerprint"]
+        self.result["head"] = manifest["head"]
+        self.result["adapter_sha256"] = digest(json_bytes(self.config))
+        with tarfile.open(archive_path) as archive:
+            for name in self.config.get("controller_files", []):
+                safe_relative(name)
+                entry = archive.getmember(name)
+                if not entry.isfile():
+                    raise Refusal("Controller must be a regular snapshot file")
+                target = self.controller / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(archive.extractfile(entry).read())
+                target.chmod(entry.mode)
+        self.create_resource("network", self.network,
+                             ["docker", "network", "create", *self.labels(), self.network], "create test network")
+        self.create_resource("volume", self.volume,
+                             ["docker", "volume", "create", *self.labels(), self.volume], "create source volume")
+        for service in self.config["services"]:
+            self.create_service(service)
+        environment = expand(self.config["environment"], self.variables)
+        argv = ["docker", "create", "--name", self.container, *self.labels(), "--init",
+                "--hostname", self.container, "--workdir", self.config["workdir"],
+                "--network", self.network, "--mount", f"type=volume,src={self.volume},dst={self.config['workdir']},volume-nocopy",
+                "--entrypoint", "sleep"]
+        for key in environment:
+            argv += ["--env", key]
+        argv += [image, "infinity"]
+        self.create_resource("container", self.container, argv, "create test container", env=self.base_env | environment)
+        self.command(["docker", "start", self.container], "start test container")
+        details = self.docker_json("container", self.container)
+        if any(m["Type"] != "volume" for m in details["Mounts"]) or len(details["Mounts"]) != 1:
+            raise Refusal("Test application must have only the explicitly owned source volume")
+        # volume-nocopy starts empty and root-owned, even for a non-root image.
+        # Change only the fresh mount's ownership, then load/test as the image user.
+        uid = output(["docker", "exec", self.container, "id", "-u"], env=self.base_env)
+        gid = output(["docker", "exec", self.container, "id", "-g"], env=self.base_env)
+        if not uid.isdecimal() or not gid.isdecimal():
+            raise Refusal("Could not determine numeric runtime user")
+        self.result["runtime_user"] = uid + ":" + gid
+        self.command(["docker", "exec", "--user", "0:0", self.container, "chown", uid + ":" + gid,
+                      self.config["workdir"]], "initialize source ownership")
+        with archive_path.open("rb") as source:
+            self.command(["docker", "exec", "-i", self.container, "tar", "--no-same-owner", "-xf", "-"],
+                         "load source snapshot", stdin=source)
+        self.verify_snapshot(manifest)
+        for step in self.config["prepare"]:
+            self.execute_step(step)
+        self.verify_snapshot(manifest)
+        self.result["status"] = "testing"
+        self.result["snapshot_verified"] = True
+        self.save()
+        print(f"wt-test: testing {manifest['fingerprint'][:16]} ({len(manifest['files'])} files)", flush=True)
+        for step in self.config["profiles"][self.args.profile]["steps"]:
+            self.execute_step(step)
+        self.result["checks_passed"] = True
+        self.result["current_source_matches"] = scan_source(self.worktree, patterns) == manifest["files"]
+
+    def cleanup(self):
+        # Never use wt-down: these resources are unrelated to the interactive clone.
+        self.terminate_child()
+        stopped = True
+        owned_app = False
+        for kind, name in reversed(self.resources):
+            if kind != "container":
+                continue
+            try:
+                if not self.resource_exists(kind, name):
+                    continue
+                details = self.docker_json(kind, name)
+                if details["Config"].get("Labels", {}).get(RUN_LABEL) != self.run_id:
+                    raise Refusal("Ownership label mismatch")
+                if name == self.container:
+                    owned_app = True
+                if details["State"]["Running"]:
+                    output(["docker", "stop", "--time", "5", name], env=self.base_env)
+                if self.docker_json(kind, name)["State"]["Running"]:
+                    raise Refusal("Container still running")
+            except Exception as error:
+                stopped = False
+                self.result["cleanup_errors"].append(f"stop {name}: {error}")
+        if owned_app:
+            destination = self.report / "junit"
+            destination.mkdir(exist_ok=True)
+            copy = subprocess.run(["docker", "cp", self.container + ":/tmp/wt-test-reports/.", str(destination)],
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=self.base_env, timeout=30)
+            expected = self.config["profiles"][self.args.profile].get("reports", [])
+            if copy.returncode and self.result.get("snapshot_verified"):
+                self.result["cleanup_errors"].append("Test reports could not be collected; stopped resources retained for recovery")
+                stopped = False
+            elif self.result.get("checks_passed") and any(not (destination / f).is_file() for f in expected):
+                self.result["cleanup_errors"].append("Expected test reports were not produced")
+        if stopped:
+            # Every DB is tmpfs in this run's own service container; no shared DB drop.
+            for template in self.config.get("host_locks", []):
+                path = Path(expand(template, self.variables))
+                if path.parent != Path("/tmp") or self.variables["db_suffix"] not in path.name:
+                    self.result["cleanup_errors"].append("Refused non-run-owned host lock")
+                    continue
+                try:
+                    if path.is_symlink():
+                        raise Refusal("Lock is a symlink")
+                    path.rmdir()
+                except FileNotFoundError:
+                    pass
+                except Exception as error:
+                    self.result["cleanup_errors"].append(f"remove lock {path}: {error}")
+            for kind in ("container", "volume", "network"):
+                for resource_kind, name in reversed(self.resources):
+                    if kind != resource_kind:
+                        continue
+                    try:
+                        if not self.resource_exists(kind, name):
+                            continue
+                        details = self.docker_json(kind, name)
+                        labels = details.get("Config", {}).get("Labels", {}) if kind == "container" else details.get("Labels", {})
+                        if labels.get(RUN_LABEL) != self.run_id:
+                            raise Refusal("Ownership label mismatch")
+                        output(["docker", kind, "rm", name], env=self.base_env)
+                        if self.resource_exists(kind, name):
+                            raise Refusal("Resource remains after removal")
+                    except Exception as error:
+                        self.result["cleanup_errors"].append(f"remove {kind} {name}: {error}")
+        self.temporary.cleanup()
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("project")
+    parser.add_argument("slug")
+    parser.add_argument("--profile", default="full", help="adapter profile (default: full)")
+    parser.add_argument("--image", help="existing local runtime image; otherwise use verified worktree container image")
+    parser.add_argument("--output-dir", help="new directory for retained logs, manifest and result")
+    args = parser.parse_args(argv)
+    stack = Path(__file__).resolve().parents[2]
+    runner = None
+    started = time.monotonic()
+    def interrupted(signum, frame):
+        raise Interrupted(signum)
+    signal.signal(signal.SIGINT, interrupted)
+    signal.signal(signal.SIGTERM, interrupted)
+    code = 1
+    try:
+        if not SAFE_NAME.fullmatch(args.project) or not SAFE_NAME.fullmatch(args.slug):
+            raise Refusal("Project and slug must match [a-z][a-z0-9-]*")
+        adapter = stack / args.project / "wt-test.json"
+        if not adapter.is_file():
+            raise Refusal(f"No wt-test adapter for {args.project}; use that project's existing test workflow")
+        config = load_config(adapter)
+        if args.profile not in config["profiles"]:
+            raise Refusal("Unknown profile; choose " + ", ".join(config["profiles"]))
+        runner = Runner(stack, args, config)
+        runner.save()
+        print("wt-test: reports " + str(runner.report), flush=True)
+        runner.run()
+        code = 0
+    except Interrupted as error:
+        code = 128 + error.signum
+        if runner:
+            runner.result["error"] = "Interrupted; checks did not pass"
+    except (Refusal, OSError, ValueError, KeyError, tarfile.TarError, subprocess.TimeoutExpired) as error:
+        print("wt-test: " + str(error), file=sys.stderr, flush=True)
+        if runner:
+            runner.result["error"] = str(error)
+    finally:
+        if runner:
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            try:
+                runner.cleanup()
+            except Exception as error:
+                runner.result["cleanup_errors"].append(str(error))
+            if runner.result["cleanup_errors"]:
+                code = code or 1
+            runner.result.update(status="passed" if code == 0 else "failed", exit_code=code,
+                                 full_gate_passed=code == 0 and runner.result["full_gate"],
+                                 total_seconds=round(time.monotonic() - started, 3))
+            runner.save()
+            print(f"wt-test: {runner.result['status']} ({args.profile}); {runner.report / 'result.json'}", flush=True)
+            for error in runner.result["cleanup_errors"]:
+                print("wt-test: cleanup incomplete: " + error, file=sys.stderr)
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
